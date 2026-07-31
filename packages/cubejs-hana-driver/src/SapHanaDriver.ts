@@ -1,32 +1,93 @@
+/// <reference path="./hana.d.ts" />
+
 /**
  * @copyright Cube Dev, Inc.
  * @license Apache-2.0
  * @fileoverview The `SapHanaDriver` and related types declaration.
  */
 
-import {
-  getEnv,
-  assertDataSource,
-} from '@cubejs-backend/shared';
-import genericPool from 'generic-pool';
+import { getEnv, assertDataSource } from '@cubejs-backend/shared';
+import genericPool, { type Pool } from 'generic-pool';
 import { promisify } from 'util';
 import {
   BaseDriver,
-  GenericDataBaseType,
-  DriverInterface,
-  DownloadQueryResultsOptions,
-  StreamOptions,
+  type GenericDataBaseType,
+  type DriverInterface,
+  type DownloadQueryResultsOptions,
+  type DownloadQueryResultsResult,
+  type StreamOptions,
+  type QueryOptions,
 } from '@cubejs-backend/base-driver';
-import { ConnectionOptions, Connection, FieldInfo } from 'types-hana-client';
 
-const hdb = require('@sap/hana-client');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import hanaClient = require('@sap/hana-client');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import TypeCode = require('@sap/hana-client/extension/TypeCode');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import Stream = require('@sap/hana-client/extension/Stream');
 
-const TypeCode = require('@sap/hana-client/extension/TypeCode');
-const Stream = require('@sap/hana-client/extension/Stream');
+interface HanaConnectionOptions {
+  host?: string;
+  port?: number;
+  serverNode?: string;
+  uid?: string;
+  pwd?: string;
+  schema?: string;
+  databaseName?: string;
+  autoCommit?: boolean;
+  ca?: string;
+  encrypt?: boolean;
+  sslValidateCertificate?: boolean;
+}
+
+interface HanaFieldInfo {
+  columnName: string;
+  originalColumnName: string;
+  tableName: string;
+  ownerName: string;
+  type: number;
+  typeName: string;
+  nativeType: number;
+  nativeTypeName: string;
+  precision: number;
+  scale: number;
+  nullable: number;
+}
+
+interface HanaResultSet {
+  next(): boolean;
+  getValues<T = Record<string, unknown>>(): T;
+  getColumnInfo(): HanaFieldInfo[];
+}
+
+interface HanaStatement {
+  exec(fn: (error: Error | null, rows: unknown[]) => void): void;
+  exec(params: unknown[], fn: (error: Error | null, rows: unknown[]) => void): void;
+  execQuery(params: unknown[], fn: (error: Error | null, rs: HanaResultSet) => void): void;
+  execQuery(params: unknown[]): HanaResultSet;
+}
+
+interface HanaRawConnection {
+  connect: (opts: HanaConnectionOptions, cb: (err: Error | null) => void) => void;
+  exec: (
+    sql: string,
+    params: unknown[] | ((err: Error | null, rows: unknown[]) => void),
+    cb?: (err: Error | null, rows: unknown[]) => void,
+  ) => void;
+  end: (cb: (err: Error | null) => void) => void;
+  prepare: (sql: string) => HanaStatement;
+  on?: (event: string, cb: () => void) => void;
+  execute?: (sql: string, params?: unknown[]) => Promise<unknown[]>;
+  destroy?: () => void;
+}
+
+interface HanaPoolConnection extends HanaRawConnection {
+  execute: (sql: string, params?: unknown[]) => Promise<unknown[]>;
+}
 
 // convert HANA build-in types with type:type object
 const HanaBuildInTypes: Record<string, string> = {};
-Object.entries(TypeCode).forEach(([key, _]) => {
+Object.entries(TypeCode).forEach(([key]) => {
   HanaBuildInTypes[key] = key;
 });
 
@@ -39,15 +100,23 @@ const SapHanaToGenericType: Record<string, GenericDataBaseType> = {
   tinyint: 'int',
 };
 
-export interface SapHanaDriverConfiguration extends ConnectionOptions{
-  readOnly?: boolean,
-  loadPreAggregationWithoutMetaLock?: boolean,
-  storeTimezone?: string,
-  pool?: any,
-}
-
-interface SapHanaConnection extends Connection {
-  execute: (options: string, values?: any) => Promise<any>
+export interface SapHanaDriverConfiguration {
+  host?: string;
+  port?: number;
+  serverNode?: string;
+  uid?: string;
+  pwd?: string;
+  schema?: string;
+  databaseName?: string;
+  autoCommit?: boolean;
+  ca?: string;
+  encrypt?: boolean;
+  sslValidateCertificate?: boolean;
+  readOnly?: boolean;
+  loadPreAggregationWithoutMetaLock?: boolean;
+  storeTimezone?: string;
+  currentSchema?: string;
+  pool?: Partial<genericPool.Options>;
 }
 
 /**
@@ -63,109 +132,110 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
 
   protected readonly config: SapHanaDriverConfiguration;
 
-  protected pool: genericPool.Pool<SapHanaConnection>;
-
-  protected hdb: any;
+  protected pool: Pool<HanaPoolConnection>;
 
   /**
    * Class constructor.
    */
   public constructor(
     config: SapHanaDriverConfiguration & {
-      dataSource?: string,
-      maxPoolSize?: number,
-    } = {}
+      dataSource?: string;
+      maxPoolSize?: number;
+    } = {},
   ) {
     super();
 
-    const dataSource =
-      config.dataSource ||
-      assertDataSource('default');
+    const dataSource = config.dataSource || assertDataSource('default');
 
-    this.hdb = hdb;
-
-    const { pool, ...restConfig } = config;
+    const { pool, host: configHost, port: configPort, ...restConfig } = config;
+    const host = configHost || getEnv('dbHost', [{ dataSource }]);
+    const port = configPort || getEnv('dbPort', [{ dataSource }]);
     this.config = {
-      serverNode: getEnv('dbHost', { dataSource }),
-      uid: getEnv('dbUser', { dataSource }),
-      pwd: getEnv('dbPass', { dataSource }),
+      serverNode: port ? `${host}:${port}` : host,
+      uid: getEnv('dbUser', [{ dataSource }]),
+      pwd: getEnv('dbPass', [{ dataSource }]),
       encrypt: true,
-      sslValidateCertificate: false,
+      sslValidateCertificate: true,
       readOnly: true,
       ...restConfig,
     };
-    this.pool = genericPool.createPool({
-      create: async () => {
-        const conn: any = hdb.createConnection();
-        const connect = promisify(conn.connect.bind(conn));
-
-        if (conn.on) {
-          // there is no `on` method on HANA connection
-          conn.on('error', () => {
-            conn.destroy();
-          });
-        }
-        conn.execute = promisify(conn.exec.bind(conn));
-
-        await connect(this.config);
-
-        return conn;
+    this.pool = genericPool.createPool(
+      {
+        create: async () => {
+          const raw = hanaClient.createConnection() as HanaRawConnection;
+          const connect = promisify(raw.connect.bind(raw)) as (
+            opts: SapHanaDriverConfiguration,
+          ) => Promise<void>;
+          if (raw.on) {
+            raw.on('error', () => {
+              raw.destroy?.();
+            });
+          }
+          const poolConn = raw as HanaPoolConnection;
+          poolConn.execute = promisify(raw.exec.bind(raw)) as (
+            sql: string,
+            params?: unknown[],
+          ) => Promise<unknown[]>;
+          await connect(this.config);
+          return poolConn;
+        },
+        validate: async (connection) => {
+          try {
+            await connection.execute('SELECT 1 FROM DUMMY');
+          } catch (e) {
+            this.databasePoolError(e);
+            return false;
+          }
+          return true;
+        },
+        destroy: (connection) => promisify(connection.end.bind(connection))(),
       },
-      validate: async (connection) => {
-        try {
-          await connection.execute('SELECT 1 FROM DUMMY');
-        } catch (e) {
-          this.databasePoolError(e);
-          return false;
-        }
-        return true;
+      {
+        min: 0,
+        max: config.maxPoolSize || getEnv('dbMaxPoolSize', [{ dataSource }]) || 8,
+        evictionRunIntervalMillis: 10000,
+        softIdleTimeoutMillis: 30000,
+        idleTimeoutMillis: 30000,
+        testOnBorrow: true,
+        acquireTimeoutMillis: 20000,
+        ...pool,
       },
-      destroy: (connection) => promisify(connection.end.bind(connection))(),
-    }, {
-      min: 0,
-      max:
-        config.maxPoolSize ||
-        getEnv('dbMaxPoolSize', { dataSource }) ||
-        8,
-      evictionRunIntervalMillis: 10000,
-      softIdleTimeoutMillis: 30000,
-      idleTimeoutMillis: 30000,
-      testOnBorrow: true,
-      acquireTimeoutMillis: 20000,
-      ...pool
-    });
+    );
   }
 
   public readOnly() {
     return !!this.config.readOnly;
   }
 
-  protected async getConnectionFromPool() {
-    return (<any> this.pool)._factory.create();
+  protected async getConnectionFromPool(): Promise<HanaPoolConnection> {
+    return this.pool.acquire();
   }
 
-  public async testConnection() {
-    // eslint-disable-next-line no-underscore-dangle
-    const conn: SapHanaConnection = await this.getConnectionFromPool();
-
+  public async testConnection(): Promise<void> {
+    const conn = await this.getConnectionFromPool();
     try {
-      return await conn.execute('SELECT 1 FROM DUMMY');
+      await conn.execute('SELECT 1 FROM DUMMY');
     } finally {
-      // eslint-disable-next-line no-underscore-dangle
-      await (<any> this.pool)._factory.destroy(conn);
+      await this.pool.release(conn);
     }
   }
 
-  public async query(query: string, values: unknown[]) {
+  public async query<R = unknown>(
+    query: string,
+    values: unknown[],
+    _options?: QueryOptions,
+  ): Promise<R[]> {
     const conn = await this.getConnectionFromPool();
-    const res = await conn.execute(query, values || {});
-    return res;
+    try {
+      return (await conn.execute(query, values || [])) as R[];
+    } finally {
+      await this.pool.release(conn);
+    }
   }
 
-  public async queryResultSet(query: string, values: unknown[]) {
-    const conn = await this.getConnectionFromPool();
-
-    return conn.prepare(query).execQuery(values);
+  protected queryResultSet(conn: HanaPoolConnection, query: string, values: unknown[]): HanaResultSet {
+    const stmt = conn.prepare(query);
+    return stmt.execQuery(values);
   }
 
   public async release() {
@@ -180,7 +250,7 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
              columns.SCHEMA_NAME as ${this.quoteIdentifier('table_schema')},
              columns.DATA_TYPE_NAME as ${this.quoteIdentifier('data_type')}
       FROM SYS.TABLE_COLUMNS columns
-      WHERE columns.SCHEMA_NAME = '${this.config.uid}'
+      WHERE columns.SCHEMA_NAME = '${this.config.currentSchema || this.config.uid}'
    `;
   }
 
@@ -188,37 +258,41 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
     return `"${identifier}"`;
   }
 
-  public loadPreAggregationIntoTable(preAggregationTableName: string, loadSql: any, params: any, tx: any) {
+  public loadPreAggregationIntoTable(
+    preAggregationTableName: string,
+    loadSql: string,
+    params: unknown[],
+    tx: unknown,
+  ) {
     if (this.config.loadPreAggregationWithoutMetaLock) {
-      return this.cancelCombinator(async (saveCancelFn: any) => {
-        await saveCancelFn(this.query(`${loadSql} LIMIT 0`, params));
-        await saveCancelFn(this.query(loadSql.replace(/^CREATE TABLE (\S+) AS/i, 'INSERT INTO $1'), params));
-      });
+      return this.cancelCombinator(
+        async (saveCancelFn: (p: Promise<unknown>) => Promise<unknown>) => {
+          await saveCancelFn(this.query(`${loadSql} LIMIT 0`, params));
+          await saveCancelFn(
+            this.query(loadSql.replace(/^CREATE TABLE (\S+) AS/i, 'INSERT INTO $1'), params),
+          );
+        },
+      );
     }
 
     return super.loadPreAggregationIntoTable(preAggregationTableName, loadSql, params, tx);
   }
 
   public async stream(query: string, values: unknown[], _: StreamOptions) {
-    // eslint-disable-next-line no-underscore-dangle
-    const conn: SapHanaConnection = await (<any> this.pool)._factory.create();
-
+    const conn = await this.getConnectionFromPool();
     try {
-      const resultSet = await this.queryResultSet(query, values);
+      const resultSet = this.queryResultSet(conn, query, values);
       const columnInfo = resultSet.getColumnInfo();
-
       const rowStream = Stream.createObjectStream(resultSet);
       return {
         rowStream,
         types: this.mapFieldsToGenericTypes(columnInfo),
         release: async () => {
-          // eslint-disable-next-line no-underscore-dangle
-          await (<any> this.pool)._factory.destroy(conn);
-        }
+          await this.pool.release(conn);
+        },
       };
     } catch (e) {
-      // eslint-disable-next-line no-underscore-dangle
-      await (<any> this.pool)._factory.destroy(conn);
+      await this.pool.release(conn);
       throw e;
     }
   }
@@ -226,23 +300,27 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
   public async downloadQueryResults(
     query: string,
     values: unknown[],
-    _: DownloadQueryResultsOptions
-  ) {
-    const resultSet = await this.queryResultSet(query, values);
-    const rows = [];
-    while (resultSet.next()) {
-      rows.push(resultSet.getValues());
+    _: DownloadQueryResultsOptions,
+  ): Promise<DownloadQueryResultsResult> {
+    const conn = await this.getConnectionFromPool();
+    try {
+      const resultSet = this.queryResultSet(conn, query, values);
+      const rows: Record<string, unknown>[] = [];
+      while (resultSet.next()) {
+        rows.push(resultSet.getValues<Record<string, unknown>>());
+      }
+      return {
+        rows,
+        types: this.mapFieldsToGenericTypes(resultSet.getColumnInfo()),
+      };
+    } finally {
+      await this.pool.release(conn);
     }
-
-    return {
-      rows,
-      types: this.mapFieldsToGenericTypes(resultSet.getColumnInfo())
-    };
   }
 
-  protected mapFieldsToGenericTypes(fields: FieldInfo[]) {
+  protected mapFieldsToGenericTypes(fields: HanaFieldInfo[]) {
     return fields.map((f) => {
-      let hanaType = HanaBuildInTypes[f.nativeTypeName].toLowerCase();
+      let hanaType = HanaBuildInTypes[f.nativeTypeName]?.toLowerCase() ?? '';
 
       if (f.nativeTypeName.toLowerCase() in SapHanaToGenericType) {
         hanaType = SapHanaToGenericType[f.nativeTypeName.toLowerCase()];
@@ -250,20 +328,51 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
 
       if (!hanaType) {
         throw new Error(
-          `Unable to detect type for field "${f.columnName}" with dataTypeID: ${f.nativeTypeName}`
+          `Unable to detect type for field "${f.columnName}" with dataTypeID: ${f.nativeTypeName}`,
         );
       }
 
-      return ({
+      return {
         name: f.columnName,
-        type: this.toGenericType(hanaType)
-      });
+        type: this.toGenericType(hanaType, f.precision ?? null, f.scale ?? null),
+      };
     });
   }
 
-  public toGenericType(columnType: string) {
-    return SapHanaToGenericType[columnType.toLowerCase()] ||
+  protected toGenericType(
+    columnType: string,
+    precision?: number | null,
+    scale?: number | null,
+  ): string {
+    return (
+      SapHanaToGenericType[columnType.toLowerCase()] ||
       SapHanaToGenericType[columnType.toLowerCase().split('(')[0]] ||
-      super.toGenericType(columnType);
+      super.toGenericType(columnType, precision, scale)
+    );
+  }
+
+  protected getSchemasQuery(): string {
+    return `SELECT SCHEMA_NAME AS schema_name FROM SYS.SCHEMAS WHERE HAS_PRIVILEGES = 'TRUE'`;
+  }
+
+  protected getTablesForSpecificSchemasQuery(schemasPlaceholders: string): string {
+    return `SELECT SCHEMA_NAME AS schema_name, TABLE_NAME AS table_name
+            FROM SYS.TABLES
+            WHERE SCHEMA_NAME IN (${schemasPlaceholders})`;
+  }
+
+  protected getColumnsForSpecificTablesQuery(conditionString: string): string {
+    return `SELECT SCHEMA_NAME AS schema_name, TABLE_NAME AS table_name,
+                   COLUMN_NAME AS column_name, DATA_TYPE_NAME AS data_type
+            FROM SYS.TABLE_COLUMNS
+            WHERE ${conditionString}`;
+  }
+
+  protected getColumnNameForSchemaName(): string {
+    return 'schema_name';
+  }
+
+  protected getColumnNameForTableName(): string {
+    return 'table_name';
   }
 }
