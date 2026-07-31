@@ -300,8 +300,11 @@ export class SapHanaDriver extends BaseDriver implements DriverInterface {
   public async downloadQueryResults(
     query: string,
     values: unknown[],
-    _: DownloadQueryResultsOptions,
+    options: DownloadQueryResultsOptions,
   ): Promise<DownloadQueryResultsResult> {
+    if (options.streamImport) {
+      return this.stream(query, values, options) as Promise<DownloadQueryResultsResult>;
+    }
     const conn = await this.getConnectionFromPool();
     try {
       const resultSet = this.queryResultSet(conn, query, values);
